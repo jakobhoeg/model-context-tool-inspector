@@ -292,7 +292,11 @@ executeBtn.onclick = async () => {
 
 async function executeTool(tabId, name, inputArgs) {
   try {
-    const result = await chrome.tabs.sendMessage(tabId, { action: 'EXECUTE_TOOL', name,inputArgs });
+    const result = await chrome.tabs.sendMessage(tabId, {
+      action: 'EXECUTE_TOOL',
+      name,
+      inputArgs,
+    });
     if (result !== null) return result;
   } catch (error) {
     if (!error.message.includes('message channel is closed')) throw error;
