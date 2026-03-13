@@ -3,7 +3,15 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { GoogleGenAI } from './js-genai.js';
+import {
+  streamText,
+  generateText,
+  tool,
+  jsonSchema,
+  stepCountIs,
+  browserAI,
+  doesBrowserSupportBrowserAI,
+} from './ai-bundle.js';
 
 const statusDiv = document.getElementById('status');
 const tbody = document.getElementById('tableBody');
@@ -19,8 +27,8 @@ const userPromptText = document.getElementById('userPromptText');
 const promptBtn = document.getElementById('promptBtn');
 const traceBtn = document.getElementById('traceBtn');
 const resetBtn = document.getElementById('resetBtn');
-const apiKeyBtn = document.getElementById('apiKeyBtn');
 const promptResults = document.getElementById('promptResults');
+const downloadProgress = document.getElementById('downloadProgress');
 
 // Inject content script first.
 (async () => {
@@ -135,54 +143,87 @@ copyAsJSON.onclick = async () => {
   await navigator.clipboard.writeText(JSON.stringify(tools, '', '  '));
 };
 
-// Interact with the page
+// Browser AI
 
-let genAI, chat;
+// Use separate browserAI instances for suggestion vs prompting
+// to avoid Chrome Prompt API session caching issues (system prompt
+// is fixed at session creation time).
+let suggestModel;
+let promptModel;
+let messages = [];
 
-const envModulePromise = import('./.env.json', { with: { type: 'json' } });
-
-async function initGenAI() {
-  let env;
-  try {
-    // Try load .env.json if present.
-    env = (await envModulePromise).default;
-  } catch {}
-  if (env?.apiKey) localStorage.apiKey ??= env.apiKey;
-  localStorage.model ??= env?.model || 'gemini-2.5-flash';
-  genAI = localStorage.apiKey ? new GoogleGenAI({ apiKey: localStorage.apiKey }) : undefined;
-  promptBtn.disabled = !localStorage.apiKey;
-  resetBtn.disabled = !localStorage.apiKey;
+function createModels() {
+  suggestModel = browserAI();
+  promptModel = browserAI();
 }
-initGenAI();
+
+async function initBrowserAI() {
+  if (!doesBrowserSupportBrowserAI()) {
+    logPrompt(
+      'Browser AI not available. Requires Chrome 128+ with Prompt API flags enabled.\n' +
+        'Enable: chrome://flags/#optimization-guide-on-device-model\n' +
+        'Enable: chrome://flags/#prompt-api-for-gemini-nano-multimodal-input',
+    );
+    return;
+  }
+
+  createModels();
+
+  const availability = await suggestModel.availability();
+
+  if (availability === 'unavailable') {
+    logPrompt('Browser AI model unavailable. Enable the on-device model flag and restart Chrome.');
+    return;
+  }
+
+  if (availability === 'downloadable') {
+    downloadProgress.hidden = false;
+    downloadProgress.textContent = 'Downloading AI model...';
+    await suggestModel.createSessionWithProgress((progress) => {
+      const percent = Math.round(progress * 100);
+      downloadProgress.textContent = `Downloading AI model... ${percent}%`;
+      if (progress >= 1) {
+        downloadProgress.textContent = 'Model ready!';
+        setTimeout(() => {
+          downloadProgress.hidden = true;
+        }, 2000);
+      }
+    });
+  }
+
+  promptBtn.disabled = false;
+  resetBtn.disabled = false;
+}
+initBrowserAI();
 
 async function suggestUserPrompt() {
-  if (currentTools.length == 0 || !genAI || userPromptText.value !== lastSuggestedUserPrompt)
+  if (!currentTools || currentTools.length === 0 || !suggestModel || userPromptText.value !== lastSuggestedUserPrompt)
     return;
   const userPromptId = ++userPromptPendingId;
-  const response = await genAI.models.generateContent({
-    model: localStorage.model,
-    contents: [
-      '**Context:**',
-      `Today's date is: ${getFormattedDate()}`,
-      '**Tool Rules:**',
-      '1. **Bank Transaction Filter:** Use **PAST** dates only (e.g., "last month," "December 15th," "yesterday").',
-      '2. **Flight Search:** Use **FUTURE** dates only (e.g., "next week," "February 15th").',
-      '3. **Accommodation Search:** Use **FUTURE** dates only (e.g., "next weekend," "March 15th").',
-      '**Task:**',
-      'Generate one natural user query for a range of tools below, ideally chaining them together.',
-      'Ensure the date makes sense relative to today.',
-      'Output the query text only.',
-      '**Tools:**',
-      JSON.stringify(currentTools),
-    ],
-  });
-  if (userPromptId !== userPromptPendingId || userPromptText.value !== lastSuggestedUserPrompt)
-    return;
-  lastSuggestedUserPrompt = response.text;
-  userPromptText.value = '';
-  for (const chunk of response.text) {
-    await new Promise((r) => requestAnimationFrame(r));
-    userPromptText.value += chunk;
+  try {
+    const result = await generateText({
+      model: suggestModel,
+      prompt: [
+        '**Context:**',
+        `Today's date is: ${getFormattedDate()}`,
+        '**Task:**',
+        'Generate one natural user query for a range of tools below, ideally chaining them together.',
+        'Ensure the date makes sense relative to today.',
+        'Output the query text only.',
+        '**Tools:**',
+        JSON.stringify(currentTools),
+      ].join('\n'),
+    });
+    if (userPromptId !== userPromptPendingId || userPromptText.value !== lastSuggestedUserPrompt)
+      return;
+    lastSuggestedUserPrompt = result.text;
+    userPromptText.value = '';
+    for (const chunk of result.text) {
+      await new Promise((r) => requestAnimationFrame(r));
+      userPromptText.value += chunk;
+    }
+  } catch (e) {
+    console.warn('Failed to suggest user prompt:', e);
   }
 }
 
@@ -198,80 +239,90 @@ promptBtn.onclick = async () => {
     await promptAI();
   } catch (error) {
     trace.push({ error });
-    logPrompt(`⚠️ Error: "${error}"`);
+    logPrompt(`Error: "${error}"`);
   }
 };
 
 let trace = [];
 
+function getAITools() {
+  const aiTools = {};
+  for (const t of currentTools) {
+    const schema = t.inputSchema ? JSON.parse(t.inputSchema) : { type: 'object', properties: {} };
+    aiTools[t.name] = tool({
+      description: t.description,
+      inputSchema: jsonSchema(schema),
+      execute: async (args) => {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        const inputArgs = JSON.stringify(args);
+        logPrompt(`AI calling tool "${t.name}" with ${inputArgs}`);
+        try {
+          const result = await executeTool(tab.id, t.name, inputArgs);
+          logPrompt(`Tool "${t.name}" result: ${result}`);
+          // Artificial delay for cross-document tool discovery after navigation
+          await new Promise((r) => setTimeout(r, 500));
+          return result;
+        } catch (e) {
+          logPrompt(`Error executing tool "${t.name}": ${e.message}`);
+          return { error: e.message };
+        }
+      },
+    });
+  }
+  return aiTools;
+}
+
+function getSystemPrompt() {
+  return [
+    'You are an assistant embedded in a browser tab.',
+    'User prompts typically refer to the current tab unless stated otherwise.',
+    'Use your tools to query page content when you need it.',
+    `Today's date is: ${getFormattedDate()}`,
+    "CRITICAL RULE: Whenever the user provides a relative date (e.g., \"next Monday\", \"tomorrow\", \"in 3 days\"), you must calculate the exact calendar date based on today's date.",
+  ].join('\n');
+}
+
 async function promptAI() {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-
-  chat ??= genAI.chats.create({ model: localStorage.model });
-
   const message = userPromptText.value;
   userPromptText.value = '';
   lastSuggestedUserPrompt = '';
-  promptResults.textContent += `User prompt: "${message}"\n`;
-  const sendMessageParams = { message, config: getConfig() };
-  trace.push({ userPrompt: sendMessageParams });
-  let currentResult = await chat.sendMessage(sendMessageParams);
-  let finalResponseGiven = false;
+  logPrompt(`User prompt: "${message}"`);
 
-  while (!finalResponseGiven) {
-    const response = currentResult;
-    trace.push({ response });
-    const functionCalls = response.functionCalls || [];
+  messages.push({ role: 'user', content: message });
 
-    if (functionCalls.length === 0) {
-      if (!response.text) {
-        logPrompt(`⚠️ AI response has no text: ${JSON.stringify(response.candidates)}\n`);
-      } else {
-        logPrompt(`AI result: ${response.text?.trim()}\n`);
-      }
-      finalResponseGiven = true;
-    } else {
-      const toolResponses = [];
-      for (const { name, args } of functionCalls) {
-        const inputArgs = JSON.stringify(args);
-        logPrompt(`AI calling tool "${name}" with ${inputArgs}`);
-        try {
-          const result = await executeTool(tab.id, name, inputArgs);
-          toolResponses.push({ functionResponse: { name, response: { result } } });
-          logPrompt(`Tool "${name}" result: ${result}`);
-        } catch (e) {
-          logPrompt(`⚠️ Error executing tool "${name}": ${e.message}`);
-          toolResponses.push({
-            functionResponse: { name, response: { error: e.message } },
-          });
-        }
-      }
+  const result = streamText({
+    model: promptModel,
+    system: getSystemPrompt(),
+    messages,
+    tools: getAITools(),
+    stopWhen: stepCountIs(10),
+    onStepFinish: (step) => {
+      trace.push(step);
+    },
+  });
 
-      // FIXME: New WebMCP tools may not be discovered if there's a navigation.
-      // An articial timeout is introduced for mitigation but it's not robust enough.
-      await new Promise((r) => setTimeout(r, 500));
-
-      const sendMessageParams = { message: toolResponses, config: getConfig() };
-      trace.push({ userPrompt: sendMessageParams });
-      currentResult = await chat.sendMessage(sendMessageParams);
-    }
+  let fullText = '';
+  for await (const chunk of result.textStream) {
+    fullText += chunk;
   }
+
+  if (fullText) {
+    logPrompt(`AI result: ${fullText.trim()}\n`);
+  } else {
+    logPrompt('AI response has no text.\n');
+  }
+
+  // Append assistant response for multi-turn conversation
+  messages.push({ role: 'assistant', content: fullText || '' });
 }
 
 resetBtn.onclick = () => {
-  chat = undefined;
+  messages = [];
   trace = [];
+  createModels();
   userPromptText.value = '';
   lastSuggestedUserPrompt = '';
   promptResults.textContent = '';
-  suggestUserPrompt();
-};
-
-apiKeyBtn.onclick = async () => {
-  const apiKey = prompt('Enter Gemini API key');
-  if (apiKey == null) return;
-  localStorage.apiKey = apiKey;
-  await initGenAI();
   suggestUserPrompt();
 };
 
@@ -286,7 +337,7 @@ executeBtn.onclick = async () => {
   const name = toolNames.selectedOptions[0].value;
   const inputArgs = inputArgsText.value;
   toolResults.textContent = await executeTool(tab.id, name, inputArgs).catch(
-    (error) => `⚠️ Error: "${error}"`,
+    (error) => `Error: "${error}"`,
   );
 };
 
@@ -302,7 +353,6 @@ async function executeTool(tabId, name, inputArgs) {
     if (!error.message.includes('message channel is closed')) throw error;
   }
   // A navigation was triggered. The result will be on the next document.
-  // TODO: Handle case where a new tab is opened.
   await waitForPageLoad(tabId);
   return await chrome.tabs.sendMessage(tabId, {
     action: 'GET_CROSS_DOCUMENT_SCRIPT_TOOL_RESULT',
@@ -332,27 +382,6 @@ function getFormattedDate() {
     month: 'long',
     day: 'numeric',
   });
-}
-
-function getConfig() {
-  const systemInstruction = [
-    'You are an assistant embedded in a browser tab.',
-    'User prompts typically refer to the current tab unless stated otherwise.',
-    'Use your tools to query page content when you need it.',
-    `Today's date is: ${getFormattedDate()}`,
-    'CRITICAL RULE: Whenever the user provides a relative date (e.g., "next Monday", "tomorrow", "in 3 days"),  you must calculate the exact calendar date based on today\'s date.',
-  ];
-
-  const functionDeclarations = currentTools.map((tool) => {
-    return {
-      name: tool.name,
-      description: tool.description,
-      parametersJsonSchema: tool.inputSchema
-        ? JSON.parse(tool.inputSchema)
-        : { type: 'object', properties: {} },
-    };
-  });
-  return { systemInstruction, tools: [{ functionDeclarations }] };
 }
 
 function generateTemplateFromSchema(schema) {

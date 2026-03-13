@@ -25,14 +25,16 @@
           <tbody id="tableBody"></tbody>
         </table>
         <div id="copyToClipboard">
-          <span id="copyAsScriptToolConfig">📝 Copy as ScriptToolConfig</span>
-          <span id="copyAsJSON">📝 Copy as JSON</span>
+          <span id="copyAsScriptToolConfig">Copy as ScriptToolConfig</span>
+          <span id="copyAsJSON">Copy as JSON</span>
         </div>
       </div>
       </div>
 
       <h2 class="collapsible-header">Interact with the Page</h2>
       <div class="section-content">
+
+      <div id="downloadProgress" hidden></div>
 
       <div class="form-group">
         <label for="userPromptText">User Prompt</label>
@@ -42,7 +44,6 @@
       <div class="form-group">
         <button id="promptBtn" disabled>Send</button>
         <button id="resetBtn" class="secondary" disabled>Reset</button>
-        <button id="apiKeyBtn" class="secondary">Set Gemini API key</button>
         <button id="traceBtn" class="secondary">Copy trace</button>
       </div>
 
